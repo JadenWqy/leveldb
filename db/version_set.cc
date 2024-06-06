@@ -85,7 +85,7 @@ Version::~Version() {
 }
 
 int FindFile(const InternalKeyComparator& icmp,
-             const std::vector<FileMetaData*>& files, const Slice& key) {
+             const std::vector<FileMetaData*>& files, const Slice& key) { // key是internal key
   uint32_t left = 0;
   uint32_t right = files.size();
   while (left < right) {
@@ -287,13 +287,14 @@ void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
   tmp.reserve(files_[0].size());
   for (uint32_t i = 0; i < files_[0].size(); i++) {
     FileMetaData* f = files_[0][i];
-    if (ucmp->Compare(user_key, f->smallest.user_key()) >= 0 &&
+    if (ucmp->Compare(user_key, f->smallest.user_key()) >= 0 && // Level0无序，每个SST都可能包含Internal key(user key+tag)
         ucmp->Compare(user_key, f->largest.user_key()) <= 0) {
       tmp.push_back(f);
     }
   }
+  // level0从新SST到旧SST检查key是否存在
   if (!tmp.empty()) {
-    std::sort(tmp.begin(), tmp.end(), NewestFirst);
+    std::sort(tmp.begin(), tmp.end(), NewestFirst); 
     for (uint32_t i = 0; i < tmp.size(); i++) {
       if (!(*func)(arg, 0, tmp[i])) {
         return;
@@ -307,7 +308,7 @@ void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
     if (num_files == 0) continue;
 
     // Binary search to find earliest index whose largest key >= internal_key.
-    uint32_t index = FindFile(vset_->icmp_, files_[level], internal_key);
+    uint32_t index = FindFile(vset_->icmp_, files_[level], internal_key); // XXX: 为啥这里不能用user_key二分呢?
     if (index < num_files) {
       FileMetaData* f = files_[level][index];
       if (ucmp->Compare(user_key, f->smallest.user_key()) < 0) {
@@ -351,6 +352,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
       state->last_file_read = f;
       state->last_file_read_level = level;
 
+      // table_cache是记录已经打开过的SST文件
       state->s = state->vset->table_cache_->Get(*state->options, f->number,
                                                 f->file_size, state->ikey,
                                                 &state->saver, SaveValue);
@@ -386,12 +388,12 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
   state.last_file_read_level = -1;
 
   state.options = &options;
-  state.ikey = k.internal_key();
+  state.ikey = k.internal_key();  // user_key+tag
   state.vset = vset_;
 
   state.saver.state = kNotFound;
   state.saver.ucmp = vset_->icmp_.user_comparator();
-  state.saver.user_key = k.user_key();
+  state.saver.user_key = k.user_key();  // user_key
   state.saver.value = value;
 
   ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
@@ -519,7 +521,7 @@ void Version::GetOverlappingInputs(int level, const InternalKey* begin,
       // "f" is completely after specified range; skip it
     } else {
       inputs->push_back(f);
-      if (level == 0) {
+      if (level == 0) { // 随着level0进来，更多的level0被覆盖，level0的overlap会变大，所以持续扩大sst范围
         // Level-0 files may overlap each other.  So check if the newly
         // added file has expanded the range.  If so, restart search.
         if (begin != nullptr && user_cmp->Compare(file_start, user_begin) < 0) {
@@ -678,21 +680,26 @@ class VersionSet::Builder {
       const std::vector<FileMetaData*>& base_files = base_->files_[level];
       std::vector<FileMetaData*>::const_iterator base_iter = base_files.begin();
       std::vector<FileMetaData*>::const_iterator base_end = base_files.end();
-      const FileSet* added_files = levels_[level].added_files;
+      const FileSet* added_files = levels_[level].added_files;  // edit新增的file，也已经有序
+      // 整体添加过程是key range有序的，实现的太风骚，不忍直视
+      // 1. 把base_files和added_files合并到一起
+      // increment base_iter on the go
+      // maintain the invariant that base_iter points to the smallest file number
+      // that is not yet added to v->files_[level]
       v->files_[level].reserve(base_files.size() + added_files->size());
-      for (const auto& added_file : *added_files) {
+      for (const auto& added_file : *added_files) { // edit要添加的文件
         // Add all smaller files listed in base_
         for (std::vector<FileMetaData*>::const_iterator bpos =
                  std::upper_bound(base_iter, base_end, added_file, cmp);
              base_iter != bpos; ++base_iter) {
-          MaybeAddFile(v, level, *base_iter);
+          MaybeAddFile(v, level, *base_iter); // 比edit文件key range小的base文件
         }
 
-        MaybeAddFile(v, level, added_file);
+        MaybeAddFile(v, level, added_file); // edit文件本身
       }
 
       // Add remaining base files
-      for (; base_iter != base_end; ++base_iter) {
+      for (; base_iter != base_end; ++base_iter) {  // edit剩余要添加的文件
         MaybeAddFile(v, level, *base_iter);
       }
 
@@ -774,12 +781,13 @@ void VersionSet::AppendVersion(Version* v) {
   v->next_->prev_ = v;
 }
 
+// 这个只是改元信息了，之前已经把SST的IO搞完了
 Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
-  if (edit->has_log_number_) {
+  if (edit->has_log_number_) {  // memtable compact时候，edit会指定mem_的log number
     assert(edit->log_number_ >= log_number_);
     assert(edit->log_number_ < next_file_number_);
   } else {
-    edit->SetLogNumber(log_number_);
+    edit->SetLogNumber(log_number_);  // sst之间compact时候，log number不变，也就是没有log可以被忽略
   }
 
   if (!edit->has_prev_log_number_) {
@@ -801,15 +809,16 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   // a temporary file that contains a snapshot of the current version.
   std::string new_manifest_file;
   Status s;
-  if (descriptor_log_ == nullptr) {
+  if (descriptor_log_ == nullptr) { // 每次DB打开首次会snapshot重写一个manifest
     // No reason to unlock *mu here since we only hit this path in the
     // first call to LogAndApply (when opening the database).
     assert(descriptor_file_ == nullptr);
-    new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_);
+    new_manifest_file = DescriptorFileName(dbname_, manifest_file_number_); 
     s = env_->NewWritableFile(new_manifest_file, &descriptor_file_);
     if (s.ok()) {
+      printf("DB::Open时descriptor_log_一定是nullptr，所以recovery时涉及log recovery一定会apply edit，一定会重建manifest\n");
       descriptor_log_ = new log::Writer(descriptor_file_);
-      s = WriteSnapshot(descriptor_log_);
+      s = WriteSnapshot(descriptor_log_); 
     }
   }
 
@@ -818,7 +827,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     mu->Unlock();
 
     // Write new record to MANIFEST log
-    if (s.ok()) {
+    if (s.ok()) { // 追加edit记录到manifest文件
       std::string record;
       edit->EncodeTo(&record);
       s = descriptor_log_->AddRecord(record);
@@ -833,7 +842,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     // If we just created a new descriptor file, install it by writing a
     // new CURRENT file that points to it.
     if (s.ok() && !new_manifest_file.empty()) {
-      s = SetCurrentFile(env_, dbname_, manifest_file_number_);
+      s = SetCurrentFile(env_, dbname_, manifest_file_number_); // 让CURRENT指向MANIFEST，只有MANIFEST首次创建才执行1次，以后再也不会执行这行了
     }
 
     mu->Lock();
@@ -842,7 +851,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
   // Install the new version
   if (s.ok()) {
     AppendVersion(v);
-    log_number_ = edit->log_number_;
+    log_number_ = edit->log_number_;  // 把edit的log number更新到vset中，比如时序是：sst合并（log number不变）-> imm落盘（log number更新到mem对应的log）-> sst合并（log number仍旧是mem对应的log）-> mem变imm -> imm落盘（log number更新到新mem对应的Log)
     prev_log_number_ = edit->prev_log_number_;
   } else {
     delete v;
@@ -877,9 +886,9 @@ Status VersionSet::Recover(bool* save_manifest) {
   }
   current.resize(current.size() - 1);
 
-  std::string dscname = dbname_ + "/" + current;
+  std::string dscname = dbname_ + "/" + current;  
   SequentialFile* file;
-  s = env_->NewSequentialFile(dscname, &file);
+  s = env_->NewSequentialFile(dscname, &file);  // 打开了manifest
   if (!s.ok()) {
     if (s.IsNotFound()) {
       return Status::Corruption("CURRENT points to a non-existent file",
@@ -896,17 +905,17 @@ Status VersionSet::Recover(bool* save_manifest) {
   uint64_t last_sequence = 0;
   uint64_t log_number = 0;
   uint64_t prev_log_number = 0;
-  Builder builder(this, current_);
+  Builder builder(this, current_);  // 从空version开始，读取edit迭代构建最新version
   int read_records = 0;
 
   {
     LogReporter reporter;
     reporter.status = &s;
     log::Reader reader(file, &reporter, true /*checksum*/,
-                       0 /*initial_offset*/);
+                       0 /*initial_offset*/); // log文件有固定存储格式
     Slice record;
     std::string scratch;
-    while (reader.ReadRecord(&record, &scratch) && s.ok()) {
+    while (reader.ReadRecord(&record, &scratch) && s.ok()) {  // record是log中1条记录，也是一个version edit
       ++read_records;
       VersionEdit edit;
       s = edit.DecodeFrom(record);
@@ -935,6 +944,7 @@ Status VersionSet::Recover(bool* save_manifest) {
 
       if (edit.has_next_file_number_) {
         next_file = edit.next_file_number_;
+        // printf("next_file_number_=%llu\n",next_file);
         have_next_file = true;
       }
 
@@ -965,19 +975,21 @@ Status VersionSet::Recover(bool* save_manifest) {
   }
 
   if (s.ok()) {
+    // 将还原的version放入vset，是唯一的最新的version
     Version* v = new Version(this);
     builder.SaveTo(v);
     // Install recovered version
     Finalize(v);
     AppendVersion(v);
-    manifest_file_number_ = next_file;
+    manifest_file_number_ = next_file;  // 如果要重做manifest的话，给它预分配1个file number
+    printf("manifest_file_number_=%llu\n",manifest_file_number_); 
     next_file_number_ = next_file + 1;
     last_sequence_ = last_sequence;
     log_number_ = log_number;
     prev_log_number_ = prev_log_number;
 
     // See if we can reuse the existing MANIFEST file.
-    if (ReuseManifest(dscname, current)) {
+    if (ReuseManifest(dscname, current)) {  // manifest追加edit太久太大，重做一个
       // No need to save new manifest
     } else {
       *save_manifest = true;
@@ -1004,11 +1016,11 @@ bool VersionSet::ReuseManifest(const std::string& dscname,
       !env_->GetFileSize(dscname, &manifest_size).ok() ||
       // Make new compacted MANIFEST if old one is too big
       manifest_size >= TargetFileSize(options_)) {
-    return false;
+    return false; // 要重写MANIFEST
   }
 
-  assert(descriptor_file_ == nullptr);
-  assert(descriptor_log_ == nullptr);
+  assert(descriptor_file_ == nullptr);  
+  assert(descriptor_log_ == nullptr); // 如果不reuse manifest，那么这个字段是空的，所以上层会重写一个manifest
   Status r = env_->NewAppendableFile(dscname, &descriptor_file_);
   if (!r.ok()) {
     Log(options_->info_log, "Reuse MANIFEST: %s\n", r.ToString().c_str());
@@ -1028,6 +1040,7 @@ void VersionSet::MarkFileNumberUsed(uint64_t number) {
   }
 }
 
+// 在version中选择最值得compact的level
 void VersionSet::Finalize(Version* v) {
   // Precomputed best level for next compaction
   int best_level = -1;
@@ -1147,6 +1160,7 @@ uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {
 }
 
 void VersionSet::AddLiveFiles(std::set<uint64_t>* live) {
+  // 重要：versionset中每个version中的file都会添加到live中，避免被delete清理掉
   for (Version* v = dummy_versions_.next_; v != &dummy_versions_;
        v = v->next_) {
     for (int level = 0; level < config::kNumLevels; level++) {
@@ -1216,6 +1230,7 @@ void VersionSet::GetRange2(const std::vector<FileMetaData*>& inputs1,
   GetRange(all, smallest, largest);
 }
 
+// 将多个要merge的SST封装成1个iterator
 Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   ReadOptions options;
   options.verify_checksums = options_->paranoid_checks;
@@ -1224,7 +1239,7 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   // Level-0 files have to be merged together.  For other levels,
   // we will make a concatenating iterator per level.
   // TODO(opt): use concatenating iterator for level-0 if there is no overlap
-  const int space = (c->level() == 0 ? c->inputs_[0].size() + 1 : 2);
+  const int space = (c->level() == 0 ? c->inputs_[0].size() + 1 : 2); // 如果level i=0，那么level 0中每个SST都有独立的iter，非level 0每一层1个iter（因为非level 0整体有序）
   Iterator** list = new Iterator*[space];
   int num = 0;
   for (int which = 0; which < 2; which++) {
@@ -1237,8 +1252,9 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
         }
       } else {
         // Create concatenating iterator for the files from this level
-        list[num++] = NewTwoLevelIterator(
-            new Version::LevelFileNumIterator(icmp_, &c->inputs_[which]),
+        // 
+        list[num++] = NewTwoLevelIterator( // 在level中打开1个entry iterator，依次遍历到N个SST文件
+            new Version::LevelFileNumIterator(icmp_, &c->inputs_[which]), // 对应level的SST文件名迭代器
             &GetFileIterator, table_cache_, options);
       }
     }
@@ -1257,7 +1273,7 @@ Compaction* VersionSet::PickCompaction() {
   // the compactions triggered by seeks.
   const bool size_compaction = (current_->compaction_score_ >= 1);
   const bool seek_compaction = (current_->file_to_compact_ != nullptr);
-  if (size_compaction) {
+  if (size_compaction) {  // 策略1）基于score的compact选取策略，此前Finalize已经选好了level i
     level = current_->compaction_level_;
     assert(level >= 0);
     assert(level + 1 < config::kNumLevels);
@@ -1267,16 +1283,16 @@ Compaction* VersionSet::PickCompaction() {
     for (size_t i = 0; i < current_->files_[level].size(); i++) {
       FileMetaData* f = current_->files_[level][i];
       if (compact_pointer_[level].empty() ||
-          icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) > 0) {
-        c->inputs_[0].push_back(f);
-        break;
+          icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) > 0) {  // compact_pointer是每层level的一个轮转指针，确保每个sst都陆续排队参与compact
+        c->inputs_[0].push_back(f); // 只选1个SST就break
+        break; 
       }
     }
     if (c->inputs_[0].empty()) {
       // Wrap-around to the beginning of the key space
-      c->inputs_[0].push_back(current_->files_[level][0]);
+      c->inputs_[0].push_back(current_->files_[level][0]);  // compact_pointer后没有SST可以参与compact，那么选本层第0个文件即可
     }
-  } else if (seek_compaction) {
+  } else if (seek_compaction) { //  策略2）基于Get时miss的统计计算出的1个SST，直接对它compact
     level = current_->file_to_compact_level_;
     c = new Compaction(options_, level);
     c->inputs_[0].push_back(current_->file_to_compact_);
@@ -1288,17 +1304,17 @@ Compaction* VersionSet::PickCompaction() {
   c->input_version_->Ref();
 
   // Files in level 0 may overlap each other, so pick up all overlapping ones
-  if (level == 0) {
+  if (level == 0) { // level0的sst作为compact发起者的时候，需要把同层overlap的sst都加进来
     InternalKey smallest, largest;
-    GetRange(c->inputs_[0], &smallest, &largest);
+    GetRange(c->inputs_[0], &smallest, &largest);   //  统计这些主动发起compact SST的最小和最大key
     // Note that the next call will discard the file we placed in
     // c->inputs_[0] earlier and replace it with an overlapping set
     // which will include the picked file.
-    current_->GetOverlappingInputs(0, &smallest, &largest, &c->inputs_[0]);
+    current_->GetOverlappingInputs(0, &smallest, &largest, &c->inputs_[0]); // 把level0中overlap的其他SST找出来
     assert(!c->inputs_[0].empty());
   }
 
-  SetupOtherInputs(c);
+  SetupOtherInputs(c);  // 扩展level层的SST范围（牵扯的到同key的多个版本跨SST边界问题），然后与level+1层求overlap的sst
 
   return c;
 }
@@ -1356,25 +1372,27 @@ FileMetaData* FindSmallestBoundaryFile(
 //
 // parameters:
 //   in     level_files:      List of files to search for boundary files.
-//   in/out compaction_files: List of files to extend by adding boundary files.
+//   in/out compaction_files: List of files to extend by adding boundary files. 
+// 什么时候会出现？当compact输出N个SST时候（因为compact输出过程中，单个SST文件大小有限制，可能会写多个SST出来）会发生，所以1个SST的右边的SST可能ukey是连续的
+// 所以当从1个SST开始发起compact时候，它右边的SST要连带进来一起compact到下一层
 void AddBoundaryInputs(const InternalKeyComparator& icmp,
                        const std::vector<FileMetaData*>& level_files,
                        std::vector<FileMetaData*>* compaction_files) {
   InternalKey largest_key;
 
   // Quick return if compaction_files is empty.
-  if (!FindLargestKey(icmp, *compaction_files, &largest_key)) {
+  if (!FindLargestKey(icmp, *compaction_files, &largest_key)) {   // 除了level0会牵扯多个SST，其他level就1个SST，取出它的最大key
     return;
   }
 
   bool continue_searching = true;
   while (continue_searching) {
     FileMetaData* smallest_boundary_file =
-        FindSmallestBoundaryFile(icmp, level_files, largest_key);
+        FindSmallestBoundaryFile(icmp, level_files, largest_key);   // 找到左界和largest_key一样ukey且紧邻其后的SST
 
     // If a boundary file was found advance largest_key, otherwise we're done.
     if (smallest_boundary_file != NULL) {
-      compaction_files->push_back(smallest_boundary_file);
+      compaction_files->push_back(smallest_boundary_file);  // ukey跨边界的sst也拉进来要一起compact下去才行
       largest_key = smallest_boundary_file->largest;
     } else {
       continue_searching = false;
@@ -1382,24 +1400,28 @@ void AddBoundaryInputs(const InternalKeyComparator& icmp,
   }
 }
 
+// compact代码的灵魂函数，level和level+1层SST合并文件挑选逻辑
 void VersionSet::SetupOtherInputs(Compaction* c) {
   const int level = c->level();
   InternalKey smallest, largest;
+  
+  AddBoundaryInputs(icmp_, current_->files_[level], &c->inputs_[0]);  // ukey跨sst场景，扩展compact文件清单
+  GetRange(c->inputs_[0], &smallest, &largest); 
 
-  AddBoundaryInputs(icmp_, current_->files_[level], &c->inputs_[0]);
-  GetRange(c->inputs_[0], &smallest, &largest);
-
+  // level+1层ukey有重叠的所有SST，把它们重新merge起来，放到level+1层，删掉被merge的SST们
   current_->GetOverlappingInputs(level + 1, &smallest, &largest,
                                  &c->inputs_[1]);
-  AddBoundaryInputs(icmp_, current_->files_[level + 1], &c->inputs_[1]);
+  AddBoundaryInputs(icmp_, current_->files_[level + 1], &c->inputs_[1]);  // ??? 扩展level+1有啥意义，应该不影响ukey跨sst场景的正确性吧
 
   // Get entire range covered by compaction
   InternalKey all_start, all_limit;
-  GetRange2(c->inputs_[0], c->inputs_[1], &all_start, &all_limit);
+  GetRange2(c->inputs_[0], c->inputs_[1], &all_start, &all_limit);  // 两层SST的key范围合集
 
   // See if we can grow the number of inputs in "level" without
   // changing the number of "level+1" files we pick up.
+  // 在不invole更多level+1 sst的情况下，继续向两侧找到更多level层的sst进来一起merge下去
   if (!c->inputs_[1].empty()) {
+    // 从level i扩展更多SST
     std::vector<FileMetaData*> expanded0;
     current_->GetOverlappingInputs(level, &all_start, &all_limit, &expanded0);
     AddBoundaryInputs(icmp_, current_->files_[level], &expanded0);
@@ -1408,14 +1430,16 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
     const int64_t expanded0_size = TotalFileSize(expanded0);
     if (expanded0.size() > c->inputs_[0].size() &&
         inputs1_size + expanded0_size <
-            ExpandedCompactionByteSizeLimit(options_)) {
+            ExpandedCompactionByteSizeLimit(options_)) {  // level i扩展的SST总大小+level i+1的SST总大小在允许范围
+
+      // 用扩展后的level i SST，去level i+1找到overlap的SST，存到expanded1数组
       InternalKey new_start, new_limit;
-      GetRange(expanded0, &new_start, &new_limit);
+      GetRange(expanded0, &new_start, &new_limit);  
       std::vector<FileMetaData*> expanded1;
       current_->GetOverlappingInputs(level + 1, &new_start, &new_limit,
                                      &expanded1);
       AddBoundaryInputs(icmp_, current_->files_[level + 1], &expanded1);
-      if (expanded1.size() == c->inputs_[1].size()) {
+      if (expanded1.size() == c->inputs_[1].size()) { // 没有引入更多level i+1的SST，那么level i的SST扩展是划算的，一起compact下去
         Log(options_->info_log,
             "Expanding@%d %d+%d (%ld+%ld bytes) to %d+%d (%ld+%ld bytes)\n",
             level, int(c->inputs_[0].size()), int(c->inputs_[1].size()),
@@ -1432,6 +1456,8 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
 
   // Compute the set of grandparent files that overlap this compaction
   // (parent == level+1; grandparent == level+2)
+
+  // 计算level+2层级与本次compact重叠的SST，后续有其他用途具体还没看，不影响本次
   if (level + 2 < config::kNumLevels) {
     current_->GetOverlappingInputs(level + 2, &all_start, &all_limit,
                                    &c->grandparents_);
@@ -1441,7 +1467,7 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
   // We update this immediately instead of waiting for the VersionEdit
   // to be applied so that if the compaction fails, we will try a different
   // key range next time.
-  compact_pointer_[level] = largest.Encode().ToString();
+  compact_pointer_[level] = largest.Encode().ToString();  // 本次Level i被合并的最大SST key，下次从这个比这个key更大的sst文件继续
   c->edit_.SetCompactPointer(level, largest);
 }
 
@@ -1527,10 +1553,10 @@ bool Compaction::IsBaseLevelForKey(const Slice& user_key) {
           // Key falls in this file's range, so definitely not base level
           return false;
         }
-        break;
+        break;  // 没有overlay的下层SST（从grandparent开始）
       }
-      level_ptrs_[lvl]++;
     }
+    level_ptrs_[lvl]++; // 当前ukey已超过当前File，继续后移File位置，后续merge iter由于ukey递增，所以也不需要反复查前面的file了，极限优化啊
   }
   return true;
 }

@@ -42,6 +42,7 @@ namespace leveldb {
 
 namespace {
 
+// 假设manifest有严重损毁无法读取，那么基于log,SST做manifest重建
 class Repairer {
  public:
   Repairer(const std::string& dbname, const Options& options)
@@ -68,11 +69,12 @@ class Repairer {
   }
 
   Status Run() {
+    // 1,扫描磁盘上log,sst,manifest这些文件，记录最大file number
     Status status = FindFiles();
     if (status.ok()) {
-      ConvertLogFilesToTables();
-      ExtractMetaData();
-      status = WriteDescriptor();
+      ConvertLogFilesToTables();  // 2,log转sst
+      ExtractMetaData();  // 3,扫描所有sst，得知每个sst的最小key和最大key
+      status = WriteDescriptor(); // 4,重建manifest
     }
     if (status.ok()) {
       unsigned long long bytes = 0;
@@ -110,14 +112,14 @@ class Repairer {
     for (size_t i = 0; i < filenames.size(); i++) {
       if (ParseFileName(filenames[i], &number, &type)) {
         if (type == kDescriptorFile) {
-          manifests_.push_back(filenames[i]);
+          manifests_.push_back(filenames[i]); // manifest
         } else {
           if (number + 1 > next_file_number_) {
-            next_file_number_ = number + 1;
+            next_file_number_ = number + 1; // 下一个文件分配序号
           }
-          if (type == kLogFile) {
+          if (type == kLogFile) { // wal log
             logs_.push_back(number);
-          } else if (type == kTableFile) {
+          } else if (type == kTableFile) {  // sst
             table_numbers_.push_back(number);
           } else {
             // Ignore other files
@@ -131,12 +133,12 @@ class Repairer {
   void ConvertLogFilesToTables() {
     for (size_t i = 0; i < logs_.size(); i++) {
       std::string logname = LogFileName(dbname_, logs_[i]);
-      Status status = ConvertLogToTable(logs_[i]);
+      Status status = ConvertLogToTable(logs_[i]);  // log落sst
       if (!status.ok()) {
         Log(options_.info_log, "Log #%llu: ignoring conversion error: %s",
             (unsigned long long)logs_[i], status.ToString().c_str());
       }
-      ArchiveFile(logname);
+      ArchiveFile(logname); // log移到lost目录下归档
     }
   }
 
@@ -174,6 +176,7 @@ class Repairer {
                        0 /*initial_offset*/);
 
     // Read all the records and add to a memtable
+    // 把这个log文件重做到1个空的memtable中
     std::string scratch;
     Slice record;
     WriteBatch batch;
@@ -200,9 +203,12 @@ class Repairer {
 
     // Do not record a version edit for this conversion to a Table
     // since ExtractMetaData() will also generate edits.
+
+    // 立即把memtable转成level0 sst
     FileMetaData meta;
     meta.number = next_file_number_++;
     Iterator* iter = mem->NewIterator();
+    // 迭代memtable，写sst
     status = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
     delete iter;
     mem->Unref();
@@ -255,11 +261,11 @@ class Repairer {
 
     // Extract metadata by scanning through table.
     int counter = 0;
-    Iterator* iter = NewTableIterator(t.meta);
+    Iterator* iter = NewTableIterator(t.meta);  // 打开SST文件
     bool empty = true;
     ParsedInternalKey parsed;
     t.max_sequence = 0;
-    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {  // 迭代SST中每个ikey
       Slice key = iter->key();
       if (!ParseInternalKey(key, &parsed)) {
         Log(options_.info_log, "Table #%llu: unparsable key %s",
@@ -270,11 +276,11 @@ class Repairer {
       counter++;
       if (empty) {
         empty = false;
-        t.meta.smallest.DecodeFrom(key);
+        t.meta.smallest.DecodeFrom(key);  // SST最小key
       }
-      t.meta.largest.DecodeFrom(key);
+      t.meta.largest.DecodeFrom(key); // SST最大key
       if (parsed.sequence > t.max_sequence) {
-        t.max_sequence = parsed.sequence;
+        t.max_sequence = parsed.sequence; // SST ikey最大seq id
       }
     }
     if (!iter->status().ok()) {
@@ -360,6 +366,7 @@ class Repairer {
       }
     }
 
+    // 生成versionedit
     edit_.SetComparatorName(icmp_.user_comparator()->Name());
     edit_.SetLogNumber(0);
     edit_.SetNextFile(next_file_number_);
@@ -368,7 +375,7 @@ class Repairer {
     for (size_t i = 0; i < tables_.size(); i++) {
       // TODO(opt): separate out into multiple levels
       const TableInfo& t = tables_[i];
-      edit_.AddFile(0, t.meta.number, t.meta.file_size, t.meta.smallest,
+      edit_.AddFile(0, t.meta.number, t.meta.file_size, t.meta.smallest,  // 添加所有SST
                     t.meta.largest);
     }
 
@@ -390,12 +397,13 @@ class Repairer {
       env_->RemoveFile(tmp);
     } else {
       // Discard older manifests
+      // 归档旧的MANIFEST
       for (size_t i = 0; i < manifests_.size(); i++) {
         ArchiveFile(dbname_ + "/" + manifests_[i]);
       }
 
       // Install new manifest
-      status = env_->RenameFile(tmp, DescriptorFileName(dbname_, 1));
+      status = env_->RenameFile(tmp, DescriptorFileName(dbname_, 1)); // 临时文件rename给MANIFEST-1
       if (status.ok()) {
         status = SetCurrentFile(env_, dbname_, 1);
       } else {
@@ -443,6 +451,7 @@ class Repairer {
 };
 }  // namespace
 
+// 修复leveldb元信息
 Status RepairDB(const std::string& dbname, const Options& options) {
   Repairer repairer(dbname, options);
   return repairer.Run();
