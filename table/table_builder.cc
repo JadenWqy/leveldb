@@ -110,7 +110,7 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
     std::string handle_encoding;
     r->pending_handle.EncodeTo(&handle_encoding); // 把上1个data block的offset+size序列化写入index block
     // 1，写入index block，用data block last key作为key,值是data block偏移量
-    // 2，index block就1个，不像data block一样有N个
+    // 2，index block就1个，不像data block一样有N个restart
     r->index_block.Add(r->last_key, Slice(handle_encoding)); 
     r->pending_index_entry = false;
   }
@@ -119,13 +119,13 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
   if (r->filter_block != nullptr) {
     r->filter_block->AddKey(key);
   }
-
+  
   r->last_key.assign(key.data(), key.size());
   r->num_entries++;
   r->data_block.Add(key, value);  // entry加入data block
   
   // 当前data block大小足够大了，要结束这个block新建1个block，也是避免OOM也是为了后续扫描速度快
-  // 也就是block内有多个restart，上层又有多个block，提供了2级索引结构加速key定位
+  // 也就是一个block内有多个restart，一个table(上层又有多个block，提供了2级索引结构加速key定位
   const size_t estimated_block_size = r->data_block.CurrentSizeEstimate();
   if (estimated_block_size >= r->options.block_size) {
     Flush();  // data block落盘
@@ -156,6 +156,7 @@ void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
   //    crc: uint32
   assert(ok());
   Rep* r = rep_;
+  // Finish() would add restart point to the ending of block
   Slice raw = block->Finish();
 
   Slice block_contents;

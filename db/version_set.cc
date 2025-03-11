@@ -682,6 +682,10 @@ class VersionSet::Builder {
       std::vector<FileMetaData*>::const_iterator base_end = base_files.end();
       const FileSet* added_files = levels_[level].added_files;  // edit新增的file，也已经有序
       // 整体添加过程是key range有序的，实现的太风骚，不忍直视
+      // 1. 把base_files和added_files合并到一起
+      // increment base_iter on the go
+      // maintain the invariant that base_iter points to the smallest file number
+      // that is not yet added to v->files_[level]
       v->files_[level].reserve(base_files.size() + added_files->size());
       for (const auto& added_file : *added_files) { // edit要添加的文件
         // Add all smaller files listed in base_

@@ -107,6 +107,7 @@ Status ReadBlock(RandomAccessFile* file, const ReadOptions& options,
         // File implementation gave us pointer to some other data.
         // Use it directly under the assumption that it will be live
         // while the file is open.
+        // 1 Possible case is that the file is mmap'ed
         delete[] buf;
         result->data = Slice(data, n);
         result->heap_allocated = false;

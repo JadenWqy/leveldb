@@ -268,7 +268,7 @@ class Block::Iter : public Iterator {
       key_.resize(shared);  // 缩到shared长度
       key_.append(p, non_shared); // 再追加unshared部分
       value_ = Slice(p + non_shared, value_length);
-      // ??????
+      // decide if need to jump t
       while (restart_index_ + 1 < num_restarts_ &&
              GetRestartPoint(restart_index_ + 1) < current_) {
         ++restart_index_;
