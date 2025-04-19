@@ -944,7 +944,7 @@ Status VersionSet::Recover(bool* save_manifest) {
 
       if (edit.has_next_file_number_) {
         next_file = edit.next_file_number_;
-        // printf("next_file_number_=%llu\n",next_file);
+        // printf("next_file_number_=%" PRIu64 "\n",next_file);
         have_next_file = true;
       }
 
@@ -982,7 +982,7 @@ Status VersionSet::Recover(bool* save_manifest) {
     Finalize(v);
     AppendVersion(v);
     manifest_file_number_ = next_file;  // 如果要重做manifest的话，给它预分配1个file number
-    printf("manifest_file_number_=%llu\n",manifest_file_number_); 
+    printf("manifest_file_number_=%" PRIu64 "\n",manifest_file_number_);
     next_file_number_ = next_file + 1;
     last_sequence_ = last_sequence;
     log_number_ = log_number;
