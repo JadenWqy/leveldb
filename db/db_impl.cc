@@ -11,6 +11,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <inttypes.h>  // Add this at the top if not already
 
 #include "db/builder.h"
 #include "db/db_iter.h"
@@ -1235,7 +1236,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(updates == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
-  printf("last_sequence=%llu\n",last_sequence);
+  printf("last_sequence=%" PRIu64 "\n", last_sequence);
   Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);  
