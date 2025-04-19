@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <inttypes.h> 
 
 #include "db/filename.h"
 #include "db/log_reader.h"
